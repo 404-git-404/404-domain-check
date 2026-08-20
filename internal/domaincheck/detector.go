@@ -265,7 +265,7 @@ func (d *Detector) tlsHandshake(ctx context.Context, domain string, ip net.IP, s
 	config := &tls.Config{
 		ServerName: domain, MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13,
 		NextProtos: []string{"h2", "http/1.1"}, RootCAs: d.cfg.RootCAs,
-		InsecureSkipVerify: !strict, // READY-only; strict PRIMARY validates separately.
+		InsecureSkipVerify: !strict, // READY/diagnostic only; strict PRIMARY validates separately.
 	}
 	if x25519Only {
 		config.CurvePreferences = []tls.CurveID{tls.X25519}
@@ -279,9 +279,15 @@ func (d *Detector) tlsHandshake(ctx context.Context, domain string, ip net.IP, s
 
 func (d *Detector) probeTLSWithFallback(ctx context.Context, domain string, ip net.IP) (tlsOutcome, bool) {
 	state, _, err := d.tlsHandshake(ctx, domain, ip, true, true, d.cfg.TLSTimeout)
+	if isCertificateVerificationError(err) {
+		return d.probeCertificateFailureCapabilities(ctx, domain, ip), false
+	}
 	x25519 := err == nil && state.CurveID == tls.X25519
 	if err != nil || !x25519 {
 		state, _, err = d.tlsHandshake(ctx, domain, ip, true, false, d.cfg.TLSTimeout)
+		if isCertificateVerificationError(err) {
+			return d.probeCertificateFailureCapabilities(ctx, domain, ip), false
+		}
 	}
 	if err != nil {
 		return tlsOutcome{X25519: x25519}, false
@@ -305,6 +311,31 @@ func (d *Detector) probeTLSWithFallback(ctx context.Context, domain string, ip n
 		}
 	}
 	return out, out.TLS13
+}
+
+func (d *Detector) probeCertificateFailureCapabilities(ctx context.Context, domain string, ip net.IP) tlsOutcome {
+	// A strict handshake discards ConnectionState when certificate
+	// verification fails. Repeat only as a diagnostic probe so a bad chain
+	// or hostname does not also masquerade as TLS 1.3, X25519, and ALPN
+	// failures. Certificate status remains a hard failure.
+	state, _, err := d.tlsHandshake(ctx, domain, ip, false, true, d.cfg.TLSTimeout)
+	x25519 := err == nil && state.CurveID == tls.X25519
+	if err != nil {
+		state, _, err = d.tlsHandshake(ctx, domain, ip, false, false, d.cfg.TLSTimeout)
+	}
+	if err != nil {
+		return tlsOutcome{X25519: x25519}
+	}
+	return tlsOutcome{
+		TLS13:  state.Version == tls.VersionTLS13,
+		X25519: x25519,
+		H2:     state.NegotiatedProtocol == "h2",
+	}
+}
+
+func isCertificateVerificationError(err error) bool {
+	var verificationError *tls.CertificateVerificationError
+	return errors.As(err, &verificationError)
 }
 
 func (d *Detector) probeReady(ctx context.Context, domain string, ip net.IP) (time.Duration, error) {
