@@ -148,14 +148,18 @@ func startTLSServer(t *testing.T, domain string, curves []tls.CurveID, handler h
 }
 
 func startTLSServerWithALPN(t *testing.T, domain string, curves []tls.CurveID, nextProtos []string, handler http.Handler) *localTLSServer {
+	return startTLSServerWithVersionsAndALPN(t, domain, curves, nextProtos, tls.VersionTLS13, tls.VersionTLS13, handler)
+}
+
+func startTLSServerWithVersionsAndALPN(t *testing.T, domain string, curves []tls.CurveID, nextProtos []string, minVersion, maxVersion uint16, handler http.Handler) *localTLSServer {
 	t.Helper()
 	certificate, roots, _ := certificateFor(t, domain, 45*24*time.Hour)
 	local := &localTLSServer{root: roots}
 	server := httptest.NewUnstartedServer(handler)
 	server.EnableHTTP2 = true
 	server.TLS = &tls.Config{
-		Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS13,
-		MaxVersion: tls.VersionTLS13, CurvePreferences: curves,
+		Certificates: []tls.Certificate{certificate}, MinVersion: minVersion,
+		MaxVersion: maxVersion, CurvePreferences: curves,
 		NextProtos: nextProtos,
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			local.mu.Lock()
@@ -984,10 +988,71 @@ func TestDNSAndCertificateFailFast(t *testing.T) {
 		t.Error("HTTP must be skipped after strict certificate failure")
 	}))
 	cfg = configForServer(server, &fakeResolver{ipv4: []net.IP{net.ParseIP("127.0.0.1")}})
+	realDial := (&net.Dialer{}).DialContext
+	dials := atomic.Int32{}
+	cfg.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return realDial(ctx, network, address)
+	}
 	detector, _ = New(cfg)
 	result = detector.Check(context.Background(), "wrong-host.test")
-	if result.Result != Fail || result.CertDays != "FAIL" || result.ReadyMS != "-" || result.HTTP != "-" || !containsReason(result, "证书链、有效期或主机名验证失败") {
+	if result.Result != Fail || result.TLS13 != Pass || result.X25519 != Pass || result.H2 != Pass || result.CertDays != "FAIL" || result.ReadyMS != "-" || result.HTTP != "-" {
 		t.Fatalf("strict certificate fail-fast failed: %+v", result)
+	}
+	if !containsReason(result, "证书链、有效期或主机名验证失败") || containsReason(result, "TLS 1.3 握手失败") || containsReason(result, "强制 X25519 握手失败") || containsReason(result, "ALPN 未协商 h2") {
+		t.Fatalf("certificate failure obscured protocol capabilities: %+v", result.Reasons)
+	}
+	if dials.Load() != 3 {
+		t.Fatalf("certificate diagnostic probe dials = %d, want TCP + strict forced + diagnostic forced", dials.Load())
+	}
+}
+
+func TestCertificateDiagnosticFallbackPreservesX25519Failure(t *testing.T) {
+	const servedDomain = "certificate-p256.test"
+	server := startTLSServer(t, servedDomain, []tls.CurveID{tls.CurveP256}, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("HTTP must be skipped after strict certificate failure")
+	}))
+	cfg := configForServer(server, &fakeResolver{ipv4: []net.IP{net.ParseIP("127.0.0.1")}})
+	realDial := (&net.Dialer{}).DialContext
+	dials := atomic.Int32{}
+	cfg.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return realDial(ctx, network, address)
+	}
+	detector, _ := New(cfg)
+	result := detector.Check(context.Background(), "wrong-host-p256.test")
+
+	if result.Result != Fail || result.TLS13 != Pass || result.X25519 != Fail || result.H2 != Pass || result.CertDays != "FAIL" || result.ReadyMS != "-" || result.HTTP != "-" {
+		t.Fatalf("certificate diagnostic fallback changed real curve failure: %+v", result)
+	}
+	if !containsReason(result, "证书链、有效期或主机名验证失败") || !containsReason(result, "强制 X25519 握手失败") || containsReason(result, "TLS 1.3 握手失败") || containsReason(result, "ALPN 未协商 h2") {
+		t.Fatalf("certificate diagnostic fallback reasons changed: %+v", result.Reasons)
+	}
+	if dials.Load() != 5 {
+		t.Fatalf("certificate fallback diagnostic dials = %d, want TCP + PRIMARY + fallback + two diagnostics", dials.Load())
+	}
+}
+
+func TestNonCertificateTLSFailureSkipsDiagnosticProbe(t *testing.T) {
+	const domain = "tls12-only.test"
+	server := startTLSServerWithVersionsAndALPN(t, domain, []tls.CurveID{tls.X25519}, []string{"h2", "http/1.1"}, tls.VersionTLS12, tls.VersionTLS12, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("HTTP must be skipped after TLS version failure")
+	}))
+	cfg := configForServer(server, &fakeResolver{ipv4: []net.IP{net.ParseIP("127.0.0.1")}})
+	realDial := (&net.Dialer{}).DialContext
+	dials := atomic.Int32{}
+	cfg.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return realDial(ctx, network, address)
+	}
+	detector, _ := New(cfg)
+	result := detector.Check(context.Background(), domain)
+
+	if result.Result != Fail || result.TLS13 != Fail || result.X25519 != Fail || result.H2 != Fail || result.CertDays != "FAIL" || result.ReadyMS != "-" || result.HTTP != "-" {
+		t.Fatalf("non-certificate TLS failure classification changed: %+v", result)
+	}
+	if dials.Load() != 3 {
+		t.Fatalf("non-certificate TLS failure dials = %d, want TCP + forced PRIMARY + fallback PRIMARY", dials.Load())
 	}
 }
 
