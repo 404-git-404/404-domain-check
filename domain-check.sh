@@ -904,7 +904,8 @@ check_domain() {
         h2_evidence_present "$tls_file"; then
         h2_status='PASS'
       fi
-      if [[ "$tls_command_ok" == true ]] &&
+      if [[ "$tls_command_ok" == true &&
+        "$tls_handshake_available" == true ]] &&
         certificate_verified_evidence_present "$tls_file"; then
         certificate_status='PASS'
         if extract_leaf_certificate "$tls_file" "$leaf_certificate_file" &&

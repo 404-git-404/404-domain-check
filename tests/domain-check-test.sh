@@ -1118,17 +1118,23 @@ if [[ " $* " == *' -groups X25519 '* ]]; then
   exit "${MOCK_X25519_EXIT:-1}"
 fi
 
-if [[ ${MOCK_NORMAL_COMPLETE:-1} == 1 ]]; then
-  printf '%s\n' \
-    'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384' \
-    'ALPN protocol: h2' \
-    '-----BEGIN CERTIFICATE-----' \
-    'offline-fixture' \
-    '-----END CERTIFICATE-----' \
-    'Verify return code: 0 (ok)'
-else
-  printf '%s\n' 'CONNECTED'
-fi
+case ${MOCK_NORMAL_COMPLETE:-1} in
+  1)
+    printf '%s\n' \
+      'New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384' \
+      'ALPN protocol: h2' \
+      '-----BEGIN CERTIFICATE-----' \
+      'offline-fixture' \
+      '-----END CERTIFICATE-----' \
+      'Verify return code: 0 (ok)'
+    ;;
+  2)
+    printf '%s\n' 'CONNECTED' 'Verify return code: 0 (ok)'
+    ;;
+  *)
+    printf '%s\n' 'CONNECTED'
+    ;;
+esac
 exit "${MOCK_NORMAL_EXIT:-1}"
 EOF
 
@@ -1731,6 +1737,24 @@ assert_not_contains '连接就绪计时样本不足' "$MOCK_RUN_OUTPUT" \
   'skipped READY sampling does not report misleading sample insufficiency'
 assert_not_contains 'HTTP 请求失败' "$MOCK_RUN_OUTPUT" \
   'skipped HTTP checking does not report a misleading request failure'
+
+run_mocked_domain_check \
+  '200|200|200' \
+  '0.010|0.020|0.030' \
+  '0|0|0' \
+  '||' \
+  2
+assert_equal '1' "$MOCK_RUN_STATUS" \
+  'verification text without TLS1.3 handshake evidence remains a hard failure'
+assert_contains '证书链、有效期或主机名验证失败' "$MOCK_RUN_OUTPUT" \
+  'verification text without TLS1.3 evidence cannot promote certificate status'
+assert_not_contains '证书已验证，但无法提取到期日' "$MOCK_RUN_OUTPUT" \
+  'unestablished TLS1.3 handshake never claims certificate verification'
+assert_equal '1' \
+  "$(grep -Fc '<openssl>' "$MOCK_LOG_DIR/timeout.log")" \
+  'verification-only fixture skips the X25519 probe'
+assert_equal '0' "$(<"$MOCK_LOG_DIR/curl.count")" \
+  'verification-only fixture skips READY and HTTP curl calls'
 
 run_mocked_domain_check \
   '000|000|000' \
